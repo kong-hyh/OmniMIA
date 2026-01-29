@@ -1,4 +1,8 @@
 # OmniMIA
+## OmniMIA dataset
+In `./data` path, split by member and non-member
+
+## Run OmniMIA
 1. Run T2I task
 ```
 python text2img_image_vocab_similarity_auc.py \
