@@ -1,4 +1,6 @@
-from image_trajectory_similarity_auc import main
+"""Compatibility entry point; use run_text_to_image.py for new experiments."""
+
+from omnimia.pathways.image import main
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from omnimia.evaluation import binary_roc_auc
+from omnimia.trajectory import score_probability_trajectories
+
 
 autocast = torch.autocast
 
@@ -215,45 +218,6 @@ def _count_remaining_samples_for_all_ranks_resume(
 		r = int(_stable_record_hash(key) % int(world_size))
 		counts[r] += 1
 	return [int(x) for x in counts]
-
-
-def _roc_auc_binary(y_true: Sequence[int], y_score: Sequence[float]) -> float:
-	y_true_np = np.asarray(y_true, dtype=np.int64)
-	y_score_np = np.asarray(y_score, dtype=np.float64)
-	if y_true_np.ndim != 1 or y_score_np.ndim != 1 or y_true_np.shape[0] != y_score_np.shape[0]:
-		raise ValueError("y_true/y_score must be 1D arrays of same length")
-
-	n_pos = int((y_true_np == 1).sum())
-	n_neg = int((y_true_np == 0).sum())
-	if n_pos == 0 or n_neg == 0:
-		return float("nan")
-
-	order = np.argsort(y_score_np, kind="mergesort")
-	ranks = np.empty_like(order, dtype=np.float64)
-	ranks[order] = np.arange(1, len(y_score_np) + 1, dtype=np.float64)
-
-	sorted_scores = y_score_np[order]
-	start = 0
-	while start < len(sorted_scores):
-		end = start + 1
-		while end < len(sorted_scores) and sorted_scores[end] == sorted_scores[start]:
-			end += 1
-		if end - start > 1:
-			avg = (start + 1 + end) / 2.0
-			ranks[order[start:end]] = avg
-		start = end
-
-	pos_ranks_sum = ranks[y_true_np == 1].sum()
-	u = pos_ranks_sum - (n_pos * (n_pos + 1) / 2.0)
-	return float(u / (n_pos * n_neg))
-
-
-def _cosine_similarity_1d(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> float:
-	a = a.astype(np.float64)
-	b = b.astype(np.float64)
-	num = float(np.dot(a, b))
-	denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-	return num / max(denom, eps)
 
 
 def _parse_steps(value: str) -> Tuple[str, float]:
@@ -754,18 +718,6 @@ def _save_reconstructed_image_from_sequence(
 		return False
 
 
-def _aggregate(values: Sequence[float], how: str) -> float:
-	if not values:
-		return float("nan")
-	if how == "mean":
-		return float(np.mean(values))
-	if how == "max":
-		return float(np.max(values))
-	if how == "min":
-		return float(np.min(values))
-	raise ValueError(f"Unknown aggregate: {how}")
-
-
 def _debug_decode_built_one(
 	*,
 	backend: str,
@@ -1116,13 +1068,13 @@ class Config:
 	steps_mode: str
 	steps_value: float
 
-	topk: int
+	top_d: int
 	save_probs: bool
 	save_traj_outputs: bool
 	save_traj_tokens: bool
 	save_dtype: str
 
-	traj_aggregate: str
+	aggregation_topk: int
 	eps: float
 
 	progress: bool
@@ -1423,7 +1375,7 @@ def _process_batch(
 		)
 
 	# Quick sanity check (optional): export one decoded text+image from the first built sample.
-	# Usage: VDLM_MIA_DEBUG_DECODE=1 python image_trajectory_similarity_auc.py ...
+	# Usage: VDLM_MIA_DEBUG_DECODE=1 python -m omnimia.pathways.image --task t2i ...
 	if os.environ.get("VDLM_MIA_DEBUG_DECODE", "").strip() == "1" and built:
 		try:
 			ids_1xL, am_1xL, _pm_1xL, _span = built[0]
@@ -1464,7 +1416,7 @@ def _process_batch(
 			logits_clean = model(input_ids, attention_bias=attention_bias).logits  # [B,L,V]
 			candidate_ids = _select_topk_candidates_from_logits(
 				logits_clean,
-				topk=int(args.topk),
+				topk=int(args.top_d),
 				allow_token_mask=allow_token_mask,
 			)
 			logits_f = logits_clean.to(torch.float32)
@@ -1558,7 +1510,7 @@ def _process_batch(
 										"backend": str(backend),
 										"mask_id": int(mask_id),
 										"mask_ratio": float(args.mask_ratio),
-										"topk": int(args.topk),
+										"top_d": int(args.top_d),
 										"steps_mode": str(args.steps_mode),
 										"steps_value": float(args.steps_value),
 										"true_len": int(true_len_b),
@@ -1626,16 +1578,12 @@ def _process_batch(
 			if 0 <= tid < vocab_size and bool(allow_ids_cpu[tid].item()):
 				allowed_pos[pos - int(allowed_range[0])] = True
 
-		feats: List[np.ndarray] = []
-		for p in traj_probs:
-			feats.append(p[:, allowed_pos, :].reshape(-1).astype(np.float64))
-
-		sims: List[float] = []
-		for i in range(len(feats)):
-			for j in range(i + 1, len(feats)):
-				sims.append(_cosine_similarity_1d(feats[i], feats[j], eps=float(args.eps)))
-
-		score = _aggregate(sims, how=str(args.traj_aggregate))
+		evidence = score_probability_trajectories(
+			np.stack(traj_probs, axis=0),
+			position_mask=allowed_pos,
+			aggregation_topk=int(args.aggregation_topk),
+			eps=float(args.eps),
+		)
 
 		rec = {
 			"sample_id": int(sample_ids[b]),
@@ -1643,13 +1591,12 @@ def _process_batch(
 			args.image_key: str(image_paths[b]),
 			args.text_key: str(texts[b]),
 			args.label_key: int(labels[b]),
-			"score": float(score),
-			"pairwise_sims": sims,
-			"num_trajectories": len(traj_probs),
+			"trajectory_evidence": evidence.to_dict(),
+			"membership_score": evidence.membership_score,
 			"steps_mode": str(args.steps_mode),
 			"mask_ratio": float(args.mask_ratio),
 			"backend": str(backend),
-			"topk": int(args.topk),
+			"top_d": int(args.top_d),
 			"allowed_range": [int(allowed_range[0]), int(allowed_range[1])],
 		}
 		out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -1668,9 +1615,9 @@ def _process_batch(
 			np.savez_compressed(
 				save_path,
 				candidate_ids=cand_ids_b,
-				traj_probs=probs_stack,
-				allowed_pos=allowed_pos,
-				pos_logp=pos_logp_b,
+				trajectory_probabilities=probs_stack,
+				semantic_position_mask=allowed_pos,
+				observed_token_log_probabilities=pos_logp_b,
 				allowed_range=np.asarray([allowed_range[0], allowed_range[1]], dtype=np.int32),
 			)
 
@@ -1947,7 +1894,7 @@ def _parse_args(*, task_override: Optional[str] = None) -> Config:
 
 	p.add_argument("--seed", type=int, default=1234)
 
-	p.add_argument("--mask_ratio", type=float, default=0.3)
+	p.add_argument("--mask_ratio", type=float, default=0.5)
 	p.add_argument("--num_trajectories", type=int, default=4)
 	p.add_argument(
 		"--steps",
@@ -1956,7 +1903,14 @@ def _parse_args(*, task_override: Optional[str] = None) -> Config:
 		help=("Denoising steps: integer (abs) or float in (0,1] (rel to #masked tokens). E.g. 18 or 0.5"),
 	)
 
-	p.add_argument("--topk", type=int, default=5, help="Top-k candidate tokens per position from clean forward")
+	p.add_argument(
+		"--top_d",
+		"--topk",
+		dest="top_d",
+		type=int,
+		default=32,
+		help="Truncated probability-vector dimension d (default: 32).",
+	)
 
 	p.add_argument(
 		"--save_probs",
@@ -2006,7 +1960,12 @@ def _parse_args(*, task_override: Optional[str] = None) -> Config:
 	)
 	p.add_argument("--save_dtype", type=str, default="float16", choices=["float16", "float32"])
 
-	p.add_argument("--traj_aggregate", type=str, default="mean", choices=["mean", "max", "min"])
+	p.add_argument(
+		"--aggregation_topk",
+		type=int,
+		default=32,
+		help="k in the paper's pessimistic/optimistic hierarchical aggregation (default: 32).",
+	)
 	p.add_argument("--eps", type=float, default=1e-8)
 
 	p.add_argument(
@@ -2050,6 +2009,10 @@ def _parse_args(*, task_override: Optional[str] = None) -> Config:
 		raise ValueError("--mask_ratio must be in [0,1]")
 	if int(a.num_trajectories) < 2:
 		raise ValueError("--num_trajectories must be >= 2")
+	if int(a.top_d) < 1:
+		raise ValueError("--top_d must be >= 1")
+	if int(a.aggregation_topk) < 1:
+		raise ValueError("--aggregation_topk must be >= 1")
 
 	return Config(
 		task=str(a.task),
@@ -2074,12 +2037,12 @@ def _parse_args(*, task_override: Optional[str] = None) -> Config:
 		num_trajectories=int(a.num_trajectories),
 		steps_mode=mode,
 		steps_value=float(val),
-		topk=int(a.topk),
+		top_d=int(a.top_d),
 		save_probs=bool(a.save_probs),
 		save_traj_outputs=bool(a.save_traj_outputs),
 		save_traj_tokens=bool(a.save_traj_tokens),
 		save_dtype=str(a.save_dtype),
-		traj_aggregate=str(a.traj_aggregate),
+		aggregation_topk=int(a.aggregation_topk),
 		eps=float(a.eps),
 		progress=bool(a.progress),
 		resume=bool(a.resume),
@@ -2168,11 +2131,11 @@ def main(*, task_override: Optional[str] = None) -> None:
 						try:
 							obj = json.loads(line)
 							y_true.append(1 if int(obj.get(args.label_key, 0)) != 0 else 0)
-							y_score.append(float(obj.get("score", 0.0)))
+							y_score.append(float(obj.get("membership_score", 0.0)))
 						except Exception:
 							continue
 
-		auc = _roc_auc_binary(y_true, y_score)
+		auc = binary_roc_auc(y_true, y_score)
 		print(f"AUC={auc:.6f} (n={len(y_true)})")
 	else:
 		_run_worker(0, 1, str(args.device), args)
@@ -2197,7 +2160,7 @@ def main(*, task_override: Optional[str] = None) -> None:
 							try:
 								obj = json.loads(line)
 								y_true.append(1 if int(obj.get(args.label_key, 0)) != 0 else 0)
-								y_score.append(float(obj.get("score", 0.0)))
+								y_score.append(float(obj.get("membership_score", 0.0)))
 							except Exception:
 								continue
 			else:
@@ -2210,10 +2173,10 @@ def main(*, task_override: Optional[str] = None) -> None:
 						try:
 							obj = json.loads(line)
 							y_true.append(1 if int(obj.get(args.label_key, 0)) != 0 else 0)
-							y_score.append(float(obj.get("score", 0.0)))
+							y_score.append(float(obj.get("membership_score", 0.0)))
 						except Exception:
 							continue
-		auc = _roc_auc_binary(y_true, y_score)
+		auc = binary_roc_auc(y_true, y_score)
 		print(f"AUC={auc:.6f} (n={len(y_true)})")
 
 	config_path = os.path.join(args.output_dir, "config.json")
